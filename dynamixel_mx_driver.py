@@ -5,7 +5,7 @@ import array
 
 class dynamixel_mx(object):
     """Communication with Dynamixel MX servos."""
-    def __init__(self, port, baudrate=57600, DtrForRS485=False):
+    def __init__(self, port, baudrate=57600, timeout=0.02, DtrForRS485=False):
         """Entry point for communicating with the Dynamixel servos.
 
         Args:
@@ -17,6 +17,10 @@ class dynamixel_mx(object):
                 communicate at. Defaults to 57600, which is the factory
                 default of the Dynamixels, but you are likely to work
                 with servos configured to 1000000 baud.
+            timeout (optional[bool]): When issuing commands, the port will
+                block execution while waiting for response. If you would
+                rather like to discard "late" responses due to ex. real time
+                constraints, set the timeout to match your constraints.
             DtrForRS485 (optional[bool]): If you use a USB serial port,
                 e.g. a UartSBee to interface to a RS485 level changer, the
                 DTR can be used to set the driver to send or receive.
@@ -25,15 +29,42 @@ class dynamixel_mx(object):
         """
 
         # Initialize the port
-        # A timeout of 2 ms will give the servos
+        # A timeout of 5 ms will give the servos
         # ample time to respond
         self.serial_port = serial.Serial(port,
                     baudrate=baudrate,
-                    timeout=0.002)
+                    timeout=timeout)
 
         self._DtrForRS485 = DtrForRS485
 
-    def _send_command(self, command, verbose=False):
+    def _construct_command(self, id, instruction, parameters=None):
+        # Preample 0xFF 0xFF
+        command = [0xFF, 0xFF]
+        # ID
+        command.append(id)
+        # Length
+        if isinstance(parameters, list):
+            l = len(parameters)
+        elif parameters is None:
+            l = 0
+        else:
+            l = 1
+        command.append(2 + l)
+        # Instruction (write data = 0x03)
+        command.append(instruction)
+        # Parameters
+        if parameters:
+            command.extend(parameters)
+        # Checksum
+        checksum = (~(sum(command[2:]) & 0xFF)) & 0xFF
+        command.append(checksum)
+        return command
+
+
+    def _send_command(self, command, response_length, verbose=False):
+        if verbose:
+            print("Sending:")
+            print(command)
         buf = bytearray(command)
         # We use the DTR as enable/disable for
         # the RS485 driver. (This is because it
@@ -49,6 +80,22 @@ class dynamixel_mx(object):
         if verbose:
             print("%i bytes written" % bytes_written)
 
+        # Wait for the status package
+        #time.sleep(0.1)
+
+        # Read response
+        # The status packet will not have any
+        # payload so it will be 6 bytes long.
+        response = self.serial_port.read(6+response_length)
+        resp_list = array.array('B', response).tolist()
+        if verbose:
+            print("Status received:")
+            print(resp_list)
+            if self.check_checksum(resp_list):
+                print("Checksum checks out.")
+
+        return resp_list
+
     def ping(self, id, verbose=False):
         """ Ping a servo.
 
@@ -63,35 +110,13 @@ class dynamixel_mx(object):
             True if the servo responded, False otherwise.
 
         """
-        # Preample 0xFF 0xFF
-        command = [0xFF, 0xFF]
-        # ID
-        command.append(id)
-        # Length
-        command.append(2)
-        # Instruction (write data = 0x03)
-        command.append(0x01)
-        # Checksum
-        checksum = (~(sum(command[2:]) & 0xFF)) & 0xFF
-        command.append(checksum)
+        command = self._construct_command(id, 0x01)
+        # Clear the input buffer to prepare for the response
+        self.serial_port.reset_input_buffer()
         # Write the command to the bus
-        if verbose:
-            print("Sending:")
-            print(command)
-        self._send_command(command, verbose=verbose)
-        time.sleep(0.001) # Wait for the status package
-
-        # Read response
-        # The status packet will not have any
-        # payload so it will be 6 bytes long.
-        response = self.serial_port.read(6)
-        resp_list = array.array('B', response).tolist()
-        if verbose:
-            print("Status received:")
-            print(resp_list)
-            if self.check_checksum(resp_list):
-                print("Checksum checks out.")
-        return self.check_checksum(resp_list)
+        response = self._send_command(command, 0, verbose=verbose)
+        
+        return self.check_checksum(response)
 
     def write_data(self, id, start_address, data, verbose=False):
         """ Write data to the registers of the servos.
@@ -111,47 +136,20 @@ class dynamixel_mx(object):
             received, False is returned.
 
         """
-        # Preample 0xFF 0xFF
-        command = [0xFF, 0xFF]
-        # ID
-        command.append(id)
-        # Length
-        if isinstance(data, list):
-            command.append(3 + len(data))
-        else:
-            command.append(4)
-        # Instruction (write data = 0x03)
-        command.append(0x03)
         # Parameters (start address and value(s))
-        command.append(start_address)
+        parameters = [start_address]
         if isinstance(data, list):
-            command.extend(data)
+            parameters.extend(data)
         else:
-            command.append(data)
-        # Checksum
-        checksum = (~(sum(command[2:]) & 0xFF)) & 0xFF
-        command.append(checksum)
-
-        if verbose:
-            print("Sending:")
-            print(command)
+            parameters.append(data)
+        command = self._construct_command(id, 0x03, parameters)
+        # Clear the input buffer to prepare for the response
+        self.serial_port.reset_input_buffer()
         # Write the command to the bus
-        self._send_command(command, verbose=verbose)
+        response = self._send_command(command, 0, verbose=verbose)
 
-        # Wait for the status package
-        time.sleep(0.001)
-        # Read response
-        # The status packet will not have any
-        # payload so it will be 6 bytes long.
-        response = self.serial_port.read(6)
-        resp_list = array.array('B', response).tolist()
-        if verbose:
-            print("Status received:")
-            print(resp_list)
-            if self.check_checksum(resp_list):
-                print("Checksum checks out.")
-        if self.check_checksum(resp_list):
-            return resp_list
+        if self.check_checksum(response):
+            return response
         else:
             return False
 
@@ -168,39 +166,16 @@ class dynamixel_mx(object):
             The requested bytes in a list.
 
         """
-        # Preample 0xFF 0xFF
-        command = [0xFF, 0xFF]
-        # ID
-        command.append(id)
-        # Length
-        command.append(4)
-        # Instruction (read data = 0x03)
-        command.append(0x02)
-        # Parameters (start address and length)
-        command.append(start_address)
-        command.append(length)
-        # Checksum
-        checksum = (~(sum(command[2:]) & 0xFF)) & 0xFF
-        command.append(checksum)
-
-        if verbose:
-            print("Sending:")
-            print(command)
+        command = self._construct_command(id, 0x02, [start_address, length])
+        # Clear the input buffer to prepare for the response
+        self.serial_port.reset_input_buffer()
         # Write the command to the bus
-        self._send_command(command, verbose=verbose)
+        response = self._send_command(command, length, verbose=verbose)
 
-        # Read response
-        # The status packet will hold all the
-        # requested data.
-        # That is 6 + length bytes
-        response = self.serial_port.read(6 +length)
-        resp_list = array.array('B', response).tolist()
-        if verbose:
-            print("Status received:")
-            print(resp_list)
-            if self.check_checksum(resp_list):
-                print("Checksum checks out.")
-        return resp_list[5:-1]
+        if self.check_checksum(response):
+            return response[5:-1]
+        else:
+            return False
 
     def check_checksum(self, packet):
         if not packet:
@@ -267,7 +242,8 @@ class dynamixel_mx(object):
     def get_voltage(self, id):
         """Get the voltage in the servo."""
         v = self.read_data(id, start_address=42, length=1)
-        return v[1]/10.0
+        print(v)
+        return v[0]/10.0
 
     def set_baudrate(self, rate):
         """Set a new baud rate.
@@ -287,7 +263,7 @@ class dynamixel_mx(object):
         self.serial_port.baudrate = rate
         return response
 
-    def set_id(self, id, new_id):
+    def set_id(self, id, new_id, verbose=False):
         """Set a new id for a servo.
 
         CAUTION: If you have more than one servo with the same ID, they will
@@ -308,7 +284,7 @@ class dynamixel_mx(object):
         if not(1 <= new_id <= 253):
             raise ValueError("New ID not in range [1, 253]")
 
-        response = self.write_data(id=id, start_address=3, data=new_id)
+        response = self.write_data(id=id, start_address=3, data=new_id, verbose=verbose)
         return response
 
     def set_pid(self, id, k_p, k_i, k_d):
@@ -330,17 +306,27 @@ class dynamixel_mx(object):
 
 # Here comes some recovery tools:
 
-    def scan_ids(self):
+    def scan_ids(self, verbose=False):
         """Scan for IDs on the bus.
 
         Returns:
             A list of found IDs.
 
         """
+        # Save the current timeout. If the time out is None
+        # we will never return from pinging a non existing servo.
+        current_timeout = self.serial_port.timeout
+        if current_timeout is not None and current_timeout < 0.02:
+            self.serial_port.timeout = 0.02
+
         hits = []
         for i in range(1,254):
-            if self.ping(i):
+            if self.ping(i, verbose=verbose):
                 hits.append(i)
+        
+        # Write the timeout back
+        self.serial_port.timeout = current_timeout
+
         return hits
 
     def scan_baud(self, bauds, id=1):
@@ -370,6 +356,12 @@ class dynamixel_mx(object):
             raise ValueError("Cannot scan on broadcast ID (254)")
 
         hit = False
+
+        # Save the current timeout. If the time out is None
+        # we will never return from pinging a non existing servo.
+        current_timeout = self.serial_port.timeout
+        self.serial_port.timeout = 0.01
+        # Same for the baud rate
         current_baud = self.serial_port.baudrate
         for b in bauds:
             self.serial_port.baudrate = b
@@ -377,6 +369,9 @@ class dynamixel_mx(object):
             if self.ping(id):
                 hit = b
                 break
+
+        # Write the timeout and baud rate back
+        self.serial_port.timeout = current_timeout
         self.serial_port.baudrate = current_baud
         return hit
 
